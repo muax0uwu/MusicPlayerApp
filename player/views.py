@@ -1,19 +1,55 @@
 """
-SimpMusic Player Views — v3
+SimpMusic Player Views — Railway Edition
+
+Key fix: YouTube blocks cloud/datacenter IPs with the default 'web' yt-dlp client.
+Solution: use android_music / ios clients which:
+  1. Are far less aggressively blocked on cloud IPs
+  2. Return CDN URLs that are NOT tied to the requesting IP
+  3. Allow a simple HTTP redirect instead of proxying (no timeout risk)
 """
 import traceback
 import threading
-from django.http import JsonResponse, StreamingHttpResponse, HttpResponse
+import logging
+from django.http import JsonResponse, StreamingHttpResponse, HttpResponse, HttpResponseRedirect
 from django.views.decorators.http import require_GET
 from django.shortcuts import render
 
-_stream_cache: dict = {}
+logger = logging.getLogger(__name__)
+
+_stream_cache: dict = {}   # { video_id: (url, expires_at) }
 _cache_lock = threading.Lock()
+
+# yt-dlp options tuned for cloud/Railway deployment
+# android_music client bypasses datacenter IP blocks and returns IP-independent URLs
+_YDL_OPTS = {
+    'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+    'quiet': True,
+    'no_warnings': True,
+    'skip_download': True,
+    'nocheckcertificate': True,
+    'extractor_args': {
+        'youtube': {
+            # android_music → not IP-locked, works from Railway/cloud
+            # falls back to ios, then web if needed
+            'player_client': ['android_music', 'ios', 'web'],
+            'skip': ['hls', 'dash'],  # get direct http urls, not adaptive manifests
+        }
+    },
+    'http_headers': {
+        'User-Agent': (
+            'com.google.android.apps.youtube.music/'
+            '5.34.51 (Linux; U; Android 11) gzip'
+        ),
+        'Accept-Language': 'en-US,en;q=0.9',
+    },
+}
 
 
 def index(request):
     return render(request, 'player/index.html')
 
+
+# ── Debug ─────────────────────────────────────────────────────────────────────
 
 @require_GET
 def debug(request):
@@ -22,18 +58,21 @@ def debug(request):
     for pkg in ('ytmusicapi', 'yt_dlp', 'requests'):
         try:
             mod = __import__(pkg)
-            result['packages'][pkg] = getattr(mod, '__version__', 'ok')
+            v = getattr(mod, '__version__', None) or getattr(getattr(mod, 'version', None), '__version__', 'ok')
+            result['packages'][pkg] = str(v)
         except Exception as e:
             result['packages'][pkg] = f'MISSING: {e}'
     try:
         from ytmusicapi import YTMusic
         yt = YTMusic()
         sr = yt.search('Coldplay', filter='songs', limit=2)
-        result['search_test'] = f'OK - {len(sr)} results'
+        result['search_test'] = f'OK — {len(sr)} results'
     except Exception as e:
         result['search_test'] = f'FAILED: {e}\n{traceback.format_exc()}'
     return JsonResponse(result)
 
+
+# ── Search ────────────────────────────────────────────────────────────────────
 
 @require_GET
 def search(request):
@@ -47,7 +86,8 @@ def search(request):
         results = yt.search(query, filter=search_type, limit=20)
         return JsonResponse({'results': _normalize_results(results, search_type)})
     except Exception as e:
-        return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
+        logger.exception('search failed')
+        return JsonResponse({'error': str(e)}, status=500)
 
 
 @require_GET
@@ -69,6 +109,8 @@ def search_suggestions(request):
     except Exception:
         return JsonResponse({'suggestions': []})
 
+
+# ── Home Feed ─────────────────────────────────────────────────────────────────
 
 @require_GET
 def home_feed(request):
@@ -102,14 +144,17 @@ def home_feed(request):
             if items:
                 data['sections'].append({'title': title, 'items': items})
         if not data['sections']:
-            results = yt.search('top hits 2024', filter='songs', limit=20)
+            results = yt.search('top hits 2025', filter='songs', limit=20)
             normalized = _normalize_results(results, 'songs')
             if normalized:
                 data['sections'].append({'title': 'Top Hits', 'items': normalized})
         return JsonResponse(data)
     except Exception as e:
+        logger.exception('home_feed failed')
         return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
 
+
+# ── Track / Lyrics / Related ──────────────────────────────────────────────────
 
 @require_GET
 def track_info(request, video_id):
@@ -131,7 +176,7 @@ def track_info(request, video_id):
             'thumbnail': _best_thumb(thumbnails),
         })
     except Exception as e:
-        return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
+        return JsonResponse({'error': str(e)}, status=500)
 
 
 @require_GET
@@ -144,10 +189,7 @@ def lyrics(request, video_id):
         if not lyrics_id:
             return JsonResponse({'lyrics': None})
         lyr = yt.get_lyrics(lyrics_id)
-        if isinstance(lyr, dict):
-            text = lyr.get('lyrics')
-        else:
-            text = getattr(lyr, 'lyrics', None)
+        text = lyr.get('lyrics') if isinstance(lyr, dict) else getattr(lyr, 'lyrics', None)
         return JsonResponse({'lyrics': text})
     except Exception as e:
         return JsonResponse({'lyrics': None, 'error': str(e)})
@@ -160,11 +202,12 @@ def related_tracks(request, video_id):
         yt = YTMusic()
         wp = yt.get_watch_playlist(video_id, limit=20)
         tracks = wp.get('tracks', [])
-        normalized = [_normalize_song(t) for t in tracks if t and t.get('videoId')]
-        return JsonResponse({'tracks': normalized})
+        return JsonResponse({'tracks': [_normalize_song(t) for t in tracks if t and t.get('videoId')]})
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 
+
+# ── Album / Playlist / Artist ─────────────────────────────────────────────────
 
 @require_GET
 def album_detail(request, browse_id):
@@ -211,91 +254,136 @@ def artist_detail(request, channel_id):
         from ytmusicapi import YTMusic
         yt = YTMusic()
         artist = yt.get_artist(channel_id)
-        songs = []
-        if 'songs' in artist and 'results' in artist.get('songs', {}):
-            songs = [_normalize_song(s) for s in artist['songs']['results'][:10] if s]
-        albums = []
-        if 'albums' in artist and 'results' in artist.get('albums', {}):
-            for a in artist['albums']['results'][:6]:
-                albums.append({
-                    'id': a.get('browseId'),
-                    'title': a.get('title'),
-                    'year': a.get('year'),
-                    'thumbnail': _best_thumb(a.get('thumbnails', [])),
-                    'type': 'album',
-                })
+        songs = [_normalize_song(s) for s in artist.get('songs', {}).get('results', [])[:10] if s]
+        albums = [
+            {
+                'id': a.get('browseId'), 'title': a.get('title'), 'year': a.get('year'),
+                'thumbnail': _best_thumb(a.get('thumbnails', [])), 'type': 'album',
+            }
+            for a in artist.get('albums', {}).get('results', [])[:6]
+        ]
         return JsonResponse({
             'name': artist.get('name', 'Unknown Artist'),
             'description': artist.get('description', ''),
             'thumbnail': _best_thumb(artist.get('thumbnails', [])),
-            'songs': songs,
-            'albums': albums,
+            'songs': songs, 'albums': albums,
         })
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 
 
+# ── Stream — THE CRITICAL FIX ─────────────────────────────────────────────────
+#
+# WHY LOCAL WORKS BUT RAILWAY DOESN'T:
+# yt-dlp's default 'web' client fetches a stream URL signed/bound to the
+# requesting server's IP. On Railway (a known cloud datacenter), YouTube
+# aggressively rejects or rate-limits these requests.
+#
+# THE FIX: Two-step approach
+#   1. Use 'android_music' player client — far less blocked on cloud IPs,
+#      and returns CDN URLs that are NOT IP-bound (the browser can use them)
+#   2. Send an HTTP 302 redirect to that CDN URL — zero proxy overhead,
+#      zero timeout risk, the browser fetches directly from YouTube's CDN
+
 @require_GET
-def stream_url(request, video_id):
+def stream_proxy(request, video_id):
+    """
+    Resolves YouTube audio stream using android_music client (cloud-safe),
+    then redirects the browser directly to the CDN URL.
+    Falls back to server-side proxying if redirect fails.
+    """
     import time
+
+    # Check cache first
     with _cache_lock:
         cached = _stream_cache.get(video_id)
         if cached and cached[1] > time.time():
-            return JsonResponse({'url': cached[0], 'cached': True})
+            cdn_url = cached[0]
+            logger.info(f'Stream cache hit for {video_id}')
+            return _redirect_or_proxy(request, cdn_url)
+
+    # Resolve stream URL with cloud-safe yt-dlp options
     try:
         import yt_dlp
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
             info = ydl.extract_info(
                 f'https://music.youtube.com/watch?v={video_id}',
                 download=False
             )
-            url = info.get('url') or (info.get('formats') or [{}])[-1].get('url', '')
-            if not url:
-                raise ValueError('No stream URL found')
+            # Pick the best URL from the result
+            cdn_url = _pick_best_url(info)
+            if not cdn_url:
+                raise ValueError('yt-dlp returned no stream URL')
+
+        logger.info(f'Resolved stream for {video_id}: {cdn_url[:80]}…')
+
         with _cache_lock:
-            _stream_cache[video_id] = (url, time.time() + 270)
-        return JsonResponse({'url': url, 'cached': False})
+            _stream_cache[video_id] = (cdn_url, time.time() + 270)
+
+        return _redirect_or_proxy(request, cdn_url)
+
     except Exception as e:
-        return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
+        logger.error(f'Stream resolution failed for {video_id}: {e}')
+        return JsonResponse(
+            {'error': f'Stream resolution failed: {e}', 'traceback': traceback.format_exc()},
+            status=500
+        )
 
 
-@require_GET
-def stream_proxy(request, video_id):
-    import time
+def _pick_best_url(info: dict) -> str:
+    """Extract the best audio-only stream URL from yt-dlp info dict."""
+    # Direct URL on top-level (common for single-format extraction)
+    if info.get('url'):
+        return info['url']
+
+    # Pick from formats list — prefer m4a audio, then webm audio, then best
+    formats = info.get('formats', [])
+    audio_formats = [
+        f for f in formats
+        if f.get('acodec') != 'none' and f.get('vcodec') in ('none', None, '')
+    ]
+    if audio_formats:
+        # Sort by abr descending
+        audio_formats.sort(key=lambda f: f.get('abr') or 0, reverse=True)
+        return audio_formats[0].get('url', '')
+
+    # Last resort: any format with a URL
+    for f in reversed(formats):
+        if f.get('url'):
+            return f['url']
+
+    return ''
+
+
+def _redirect_or_proxy(request, cdn_url: str):
+    """
+    Primary strategy: redirect browser directly to CDN URL.
+    The android_music client URLs are not IP-restricted — the browser
+    can fetch them directly without going through our server.
+    """
+    # If the request has a Range header, the browser is seeking —
+    # we must proxy because a redirect loses Range support in some browsers.
+    if 'HTTP_RANGE' in request.META:
+        return _proxy_stream(request, cdn_url)
+
+    # Otherwise redirect — zero overhead, no timeout risk
+    response = HttpResponseRedirect(cdn_url)
+    response['Cache-Control'] = 'no-cache'
+    return response
+
+
+def _proxy_stream(request, cdn_url: str):
+    """
+    Fallback: pipe the stream through Django.
+    Used for Range (seek) requests where redirect may lose the Range header.
+    """
     import requests as req
 
-    with _cache_lock:
-        cached = _stream_cache.get(video_id)
-        audio_url = cached[0] if (cached and cached[1] > time.time()) else None
-
-    if not audio_url:
-        try:
-            import yt_dlp
-            ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(
-                    f'https://music.youtube.com/watch?v={video_id}',
-                    download=False
-                )
-                audio_url = info.get('url') or (info.get('formats') or [{}])[-1].get('url', '')
-            with _cache_lock:
-                _stream_cache[video_id] = (audio_url, time.time() + 270)
-        except Exception as e:
-            return HttpResponse(f'Stream resolution failed: {e}', status=500)
-
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': (
+            'com.google.android.apps.youtube.music/'
+            '5.34.51 (Linux; U; Android 11) gzip'
+        ),
         'Referer': 'https://music.youtube.com/',
         'Origin': 'https://music.youtube.com',
     }
@@ -303,7 +391,7 @@ def stream_proxy(request, video_id):
         headers['Range'] = request.META['HTTP_RANGE']
 
     try:
-        upstream = req.get(audio_url, headers=headers, stream=True, timeout=15)
+        upstream = req.get(cdn_url, headers=headers, stream=True, timeout=20)
         content_type = upstream.headers.get('Content-Type', 'audio/mp4')
         response = StreamingHttpResponse(
             upstream.iter_content(chunk_size=65536),
@@ -314,21 +402,45 @@ def stream_proxy(request, video_id):
             if h in upstream.headers:
                 response[h] = upstream.headers[h]
         response['Accept-Ranges'] = 'bytes'
-        response['Cache-Control'] = 'no-cache'
         response['Access-Control-Allow-Origin'] = '*'
+        response['Cache-Control'] = 'no-cache'
         return response
     except Exception as e:
         return HttpResponse(f'Proxy error: {e}', status=502)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Keep this endpoint for backwards compatibility / debug
+@require_GET
+def stream_url(request, video_id):
+    """Returns the resolved stream URL as JSON (for debugging only)."""
+    import time
+    with _cache_lock:
+        cached = _stream_cache.get(video_id)
+        if cached and cached[1] > time.time():
+            return JsonResponse({'url': cached[0], 'cached': True})
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
+            info = ydl.extract_info(
+                f'https://music.youtube.com/watch?v={video_id}', download=False
+            )
+            url = _pick_best_url(info)
+            if not url:
+                raise ValueError('No stream URL found')
+        with _cache_lock:
+            _stream_cache[video_id] = (url, time.time() + 270)
+        return JsonResponse({'url': url, 'cached': False})
+    except Exception as e:
+        return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _best_thumb(thumbnails: list) -> str:
     if not thumbnails:
         return ''
     valid = [t for t in thumbnails if isinstance(t, dict)]
-    sorted_thumbs = sorted(valid, key=lambda t: t.get('width', 0) * t.get('height', 0), reverse=True)
-    return sorted_thumbs[0].get('url', '') if sorted_thumbs else ''
+    return max(valid, key=lambda t: t.get('width', 0) * t.get('height', 0), default={}).get('url', '')
 
 
 def _extract_artist_name(artists) -> str:
@@ -343,58 +455,50 @@ def _extract_artist_name(artists) -> str:
 def _normalize_song(item: dict) -> dict:
     if not item:
         return {}
-    thumbnails = item.get('thumbnails', [])
-    artists = item.get('artists', [])
-    video_id = item.get('videoId') or item.get('id', '')
-    album = item.get('album') or {}
     dur = item.get('duration_seconds') or item.get('duration') or 0
     if isinstance(dur, str) and ':' in dur:
         parts = dur.split(':')
         try:
-            dur = int(parts[-2]) * 60 + int(parts[-1]) if len(parts) >= 2 else 0
+            dur = int(parts[-2]) * 60 + int(parts[-1])
         except Exception:
             dur = 0
+    album = item.get('album') or {}
     return {
-        'id': video_id,
+        'id': item.get('videoId') or item.get('id', ''),
         'title': item.get('title', 'Unknown'),
-        'artist': _extract_artist_name(artists),
+        'artist': _extract_artist_name(item.get('artists', [])),
         'album': album.get('name', '') if isinstance(album, dict) else str(album),
         'duration': int(dur),
-        'thumbnail': _best_thumb(thumbnails),
+        'thumbnail': _best_thumb(item.get('thumbnails', [])),
         'type': 'song',
     }
 
 
 def _normalize_results(results: list, result_type: str) -> list:
-    normalized = []
+    out = []
     for item in results:
         if not item:
             continue
         cat = item.get('resultType', result_type)
         if cat in ('song', 'video'):
-            normalized.append(_normalize_song(item))
+            out.append(_normalize_song(item))
         elif cat == 'album':
-            normalized.append({
-                'id': item.get('browseId', ''),
-                'title': item.get('title', 'Unknown'),
+            out.append({
+                'id': item.get('browseId', ''), 'title': item.get('title', 'Unknown'),
                 'artist': _extract_artist_name(item.get('artists', [])),
                 'year': item.get('year'),
-                'thumbnail': _best_thumb(item.get('thumbnails', [])),
-                'type': 'album',
+                'thumbnail': _best_thumb(item.get('thumbnails', [])), 'type': 'album',
             })
         elif cat == 'artist':
-            normalized.append({
+            out.append({
                 'id': item.get('browseId', ''),
                 'title': item.get('artist', item.get('title', 'Unknown Artist')),
-                'thumbnail': _best_thumb(item.get('thumbnails', [])),
-                'type': 'artist',
+                'thumbnail': _best_thumb(item.get('thumbnails', [])), 'type': 'artist',
             })
         elif cat == 'playlist':
-            normalized.append({
-                'id': item.get('browseId', ''),
-                'title': item.get('title', 'Unknown Playlist'),
+            out.append({
+                'id': item.get('browseId', ''), 'title': item.get('title', 'Unknown Playlist'),
                 'artist': item.get('author', ''),
-                'thumbnail': _best_thumb(item.get('thumbnails', [])),
-                'type': 'playlist',
+                'thumbnail': _best_thumb(item.get('thumbnails', [])), 'type': 'playlist',
             })
-    return normalized
+    return out

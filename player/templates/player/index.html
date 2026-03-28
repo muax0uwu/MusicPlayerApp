@@ -896,7 +896,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Plus J
 <!-- ── PLAYER BAR ─────────────────────────────── -->
 <div id="player">
   <div id="mini-wrap" onclick="openNP()">
-    <img id="mini-art" src="" alt="">
+    <img id="mini-art" src="" alt="" crossorigin="anonymous" onerror="this.style.opacity='0.3'">
     <div id="mini-meta">
       <div id="mini-title">Nothing playing</div>
       <div id="mini-artist"></div>
@@ -945,7 +945,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Plus J
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
     </button>
     <div class="np-art-wrap">
-      <img id="np-art" src="" alt="">
+      <img id="np-art" src="" alt="" crossorigin="anonymous" onerror="this.style.opacity='0.3'">
       <div class="np-art-eq" id="np-eq">
         <div class="wave"><span></span><span></span><span></span><span></span></div>
       </div>
@@ -1084,20 +1084,46 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 // ── Audio Setup ───────────────────────────────────────────
+let _streamRetries = 0;
+
 function setupAudio() {
   audio.addEventListener('timeupdate', onTime);
   audio.addEventListener('ended', onEnded);
-  audio.addEventListener('play', () => setPlayIcons(true));
+  audio.addEventListener('play', () => { setPlayIcons(true); setMiniArtLoading(false); });
   audio.addEventListener('pause', () => setPlayIcons(false));
-  audio.addEventListener('error', (e) => {
-    console.error('Audio error', e);
-    toast('Stream error — trying next…');
-    setTimeout(nextTrack, 1500);
-  });
+  audio.addEventListener('waiting', () => setMiniArtLoading(true));
   audio.addEventListener('canplay', () => {
-    // ensure we highlight the row
+    setMiniArtLoading(false);
+    _streamRetries = 0; // reset retries on success
     if (S.idx >= 0) highlightRow(S.queue[S.idx]?.id);
   });
+  audio.addEventListener('error', async (e) => {
+    const code = audio.error ? audio.error.code : '?';
+    const msg = audio.error ? audio.error.message : 'unknown';
+    console.error('Audio error code=' + code, msg, e);
+
+    // Retry once with a fresh stream resolve (cache might have stale URL)
+    if (_streamRetries < 1 && S.idx >= 0) {
+      _streamRetries++;
+      const item = S.queue[S.idx];
+      toast(`Stream error — retrying ${item.title}…`);
+      // Bust cache by adding a cache-bust param so Django re-resolves
+      setTimeout(() => {
+        audio.src = `/api/proxy/${item.id}/?t=${Date.now()}`;
+        audio.load();
+        audio.play().catch(() => toast('Click ▶ to start playback'));
+      }, 1200);
+    } else {
+      _streamRetries = 0;
+      toast('Stream failed — skipping to next track');
+      setTimeout(nextTrack, 1500);
+    }
+  });
+}
+
+function setMiniArtLoading(loading) {
+  const art = document.getElementById('mini-art');
+  if (art) art.style.opacity = loading ? '0.4' : '1';
 }
 
 // ── Home ──────────────────────────────────────────────────
@@ -1385,28 +1411,31 @@ async function playCurrentTrack() {
   if (!S.queue.length || S.idx < 0) return;
   const item = S.queue[S.idx];
 
+  _streamRetries = 0;
   S.nowPlaying = item;
   updateNowPlayingUI(item);
   setPlayIcons(false);
+  setMiniArtLoading(true);
   toast(`Loading: ${item.title}…`);
 
   try {
-    // Use the proxy endpoint — direct YouTube CDN URLs are blocked by browsers (CORS/auth)
+    // /api/proxy/ resolves via yt-dlp android_music client (cloud-safe)
+    // then issues a 302 redirect to YouTube's CDN — browser plays directly
     audio.src = `/api/proxy/${item.id}/`;
     audio.load();
     const playPromise = audio.play();
     if (playPromise) {
       playPromise.catch(err => {
-        // Autoplay blocked — user must click play
+        // Autoplay policy blocked — user must press play
+        setMiniArtLoading(false);
         toast('Click ▶ to start playback');
       });
     }
-
-    // Extend queue with related tracks when nearing the end
+    // Extend queue and fetch lyrics in background
     if (S.queue.length > 1 && S.idx >= S.queue.length - 3) fetchRelated(item.id);
-    // Fetch lyrics
     fetchLyrics(item.id);
   } catch(e) {
+    setMiniArtLoading(false);
     toast('Stream error: ' + e.message);
     console.error(e);
   }

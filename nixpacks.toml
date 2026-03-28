@@ -1,0 +1,12 @@
+# Railway Nixpacks config
+[phases.setup]
+nixPkgs = ["python313", "ffmpeg"]   # ffmpeg needed by yt-dlp for audio processing
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[phases.build]
+cmds = ["python manage.py collectstatic --noinput"]
+
+[start]
+cmd = "gunicorn simpmusic.wsgi:application --bind 0.0.0.0:$PORT --timeout 120 --workers 2 --threads 4 --worker-class gthread --log-level info"

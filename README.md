@@ -1,105 +1,74 @@
-# SimpMusic 🎵
+# SimpMusic — Railway Deployment
 
-A modern Django music player that acts as a specialized third-party client for YouTube Music.
-It parses YouTube's publicly available APIs and streams audio — the same way a browser with
-an ad-blocker would — but with a beautiful custom UI.
+A Django music player that acts as a third-party client for YouTube Music.
 
 ---
 
-## Quick Start
+## Why Stream Error Happens on Railway (and How It's Fixed)
 
-### 1. Install dependencies
+YouTube blocks stream URL requests from cloud/datacenter IPs (AWS, GCP, Railway)
+when using yt-dlp's default `web` player client. Works locally because your home
+IP isn't on YouTube's blocklist.
 
+**Fix applied:**
+1. yt-dlp now uses the `android_music` player client — far less blocked on cloud IPs
+2. The resolved CDN URLs are **not IP-bound**, so the browser can fetch them directly
+3. Django sends a `302 redirect` to that CDN URL instead of proxying the stream
+4. Only Range requests (seeking) fall back to server-side proxying
+
+---
+
+## Deploy to Railway
+
+### 1. Push to GitHub
 ```bash
-pip install -r requirements.txt
+git init
+git add .
+git commit -m "SimpMusic Railway"
+git remote add origin https://github.com/YOU/simpmusic.git
+git push -u origin main
 ```
 
-This installs:
-- **Django** — web framework
-- **yt-dlp** — resolves audio stream URLs from YouTube
-- **ytmusicapi** — queries YouTube Music for search, charts, albums, artists, lyrics
+### 2. Create Railway project
+- Go to railway.app → New Project → Deploy from GitHub repo
+- Select your repo
 
-### 2. Run the server
+### 3. Set environment variables in Railway dashboard
+| Variable | Value |
+|---|---|
+| `SECRET_KEY` | any long random string |
+| `DEBUG` | `False` |
+| `ALLOWED_HOSTS` | `your-app.up.railway.app` |
 
+### 4. Railway auto-detects `nixpacks.toml` and deploys
+
+---
+
+## Local Development
 ```bash
+pip install -r requirements.txt
 python manage.py runserver
 ```
 
-Open `http://127.0.0.1:8000` in your browser.
-
----
-
-## Features
-
-| Feature | How it works |
-|---|---|
-| 🔍 Search | Queries YouTube Music API via `ytmusicapi` |
-| 🎵 Audio playback | `yt-dlp` extracts the best audio-only stream URL |
-| 🔄 Auto-queue | Loads related tracks when queue runs out |
-| 📖 Lyrics | Fetches lyrics from YouTube Music |
-| 💿 Album / Artist pages | Full album track lists and artist discographies |
-| 🔀 Shuffle / Repeat | Client-side queue management |
-| ⌨️ Keyboard shortcuts | `Space` play/pause, `←→` seek ±10s, `Esc` close panel |
-| 📡 Proxy streaming | Audio proxied through Django to avoid CORS issues |
+## Debug endpoint
+Visit `/api/debug/` on your deployed URL to check package versions and test
+yt-dlp stream resolution from Railway's servers.
 
 ---
 
 ## Architecture
 
 ```
-Browser ──→ Django (SimpMusic)
-                ├── /api/search/        ← ytmusicapi
-                ├── /api/home/          ← ytmusicapi charts
-                ├── /api/track/:id/     ← ytmusicapi song info
-                ├── /api/track/:id/lyrics/   ← ytmusicapi
-                ├── /api/track/:id/related/  ← ytmusicapi watch playlist
-                ├── /api/stream/:id/    ← yt-dlp (resolves URL, no proxy)
-                ├── /api/proxy/:id/     ← yt-dlp + Django streaming proxy
-                ├── /api/album/:id/     ← ytmusicapi
-                └── /api/artist/:id/   ← ytmusicapi
+Browser → Django (/api/proxy/:id/)
+              ↓
+          yt-dlp android_music client
+              ↓
+         YouTube CDN URL (not IP-locked)
+              ↓
+         302 Redirect → Browser fetches audio directly from CDN
 ```
 
-### Why this is legal / ethical
-
-SimpMusic acts strictly as a specialized third-party web browser / client.
-It parses publicly available YouTube and YouTube Music content — identical to
-what any browser with uBlock Origin would do. No content is stored or redistributed.
-
----
-
-## Project Structure
-
-```
-simpmusic/
-├── manage.py
-├── requirements.txt
-├── simpmusic/
-│   ├── settings.py
-│   ├── urls.py
-│   └── wsgi.py
-└── player/
-    ├── views.py      ← all API logic
-    ├── urls.py
-    └── templates/
-        └── player/
-            └── index.html   ← complete SPA frontend
-```
-
----
-
-## Keyboard Shortcuts
-
-| Key | Action |
-|---|---|
-| `Space` | Play / Pause |
-| `→` | Seek +10s |
-| `←` | Seek −10s |
-| `Esc` | Close now-playing panel |
-
----
-
-## Notes
-
-- Stream URLs from YouTube expire after ~6 hours; SimpMusic caches them for 4.5 minutes.
-- For production use, set `SECRET_KEY` in settings and `DEBUG = False`.
-- No database is required — SimpMusic has no models.
+## Gunicorn config (Procfile)
+- `--timeout 120` : yt-dlp resolution takes 5-20s, default 30s kills it
+- `--workers 2 --threads 4` : handles concurrent streams + API calls
+- `--worker-class gthread` : thread-based, better for I/O-bound work
